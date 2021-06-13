@@ -1,1 +1,1 @@
-module "github.com/devhg/raft.go"
+module "github.com/devhg/raft"
