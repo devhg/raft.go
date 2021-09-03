@@ -168,7 +168,7 @@ func (cm *ConsensusModule) startElection() {
 				// 存在更高任期（新领导者），转换为追随者
 				if reply.Term > savedCurrentTerm {
 					cm.dlogf("term out of date in RequestVoteReply")
-					cm.becomeFollower()
+					cm.becomeFollower(reply.Term)
 					return
 				}
 
@@ -247,20 +247,86 @@ func (cm *ConsensusModule) runElectionTimer() {
 // becomeFollower makes CM a follower and resets its state.
 // Expects cm.mu to be locked.
 // becomeFollower方法将c变为追随者并重置其状态。要求cm.mu锁定
-func (cm *ConsensusModule) becomeFollower() {
+func (cm *ConsensusModule) becomeFollower(term int) {
+	cm.dlogf("becomes Follower with term=%d; log=%v", term, cm.log)
+	cm.state = Follower
+	cm.currentTerm = term
+	cm.votedFor = -1
+	cm.electionResetEvent = time.Now()
 
+	go cm.runElectionTimer()
 }
 
 // startLeader switches CM into a leader state and begins process of heartbeats.
 // Expects cm.mu to be locked.
 // startLeader方法将c转换为领导者，并启动心跳程序。要求cm.mu锁定
 func (cm *ConsensusModule) startLeader() {
+	cm.state = Leader
+	cm.dlogf("becomes Leader term:%s log:%v", cm.currentTerm, cm.log)
 
+	go func() {
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			cm.leaderSendHeartbeats()
+			<-ticker.C
+			cm.mu.Lock()
+			if cm.state != Leader {
+				cm.mu.Unlock()
+				return
+			}
+			cm.mu.Unlock()
+		}
+	}()
+}
+
+type AppendEntriesArgs struct {
+	Term     int
+	LeaderID int
+
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
+	return nil
 }
 
 // leaderSendHeartbeats sends a round of heartbeats to all peers, collects their
 // replies and adjusts cm's state
 // leaderSendHeartbeats 方法向所有同伴发送心跳，收集各自的回复并调整c的状态值
 func (cm *ConsensusModule) leaderSendHeartbeats() {
+	cm.mu.Lock()
+	savedCurrentTerm := cm.currentTerm
+	cm.mu.Unlock()
 
+	for _, peerID := range cm.peerIDs {
+		args := AppendEntriesArgs{
+			Term:     savedCurrentTerm,
+			LeaderID: cm.id,
+		}
+
+		go func(peerID int) {
+			cm.dlogf("sending AppendEntries to %v: ni=%d, args=%+v", peerID, 0, args)
+			var reply AppendEntriesReply
+
+			if err := cm.server.Call(peerID, "ConsensusModule.AppendEntries", args, &reply); err == nil {
+				cm.mu.Lock()
+				defer cm.mu.Unlock()
+				if reply.Term > savedCurrentTerm {
+					cm.dlogf("term out of date in heatbeat reply")
+					cm.becomeFollower(reply.Term)
+					return
+				}
+			}
+		}(peerID)
+	}
 }
