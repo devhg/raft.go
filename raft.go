@@ -12,6 +12,7 @@ import (
 
 const DebugC = 1
 
+// LogEntry used for record log.
 type LogEntry struct {
 	Command interface{}
 	Term    int
@@ -42,10 +43,16 @@ func (cs CState) String() string {
 }
 
 type ConsensusModule struct {
-	mu      *sync.Mutex
-	id      int
+	mu *sync.Mutex
+
+	// 当前CM服务器的ID
+	id int
+
+	// peerIDs 罗列了集群中所有同伴的ID
 	peerIDs []int
-	server  *Server
+
+	// server 包含当前CM的服务器，用于向其它同伴发起RPC请求
+	server *Server
 
 	// 所有服务器都需要持久化存储的 Raft state
 	currentTerm int
@@ -71,7 +78,7 @@ func NewConsensusModule(id int, peerIDs []int, server *Server, ready <-chan stru
 	cm.votedFor = -1
 
 	go func() {
-		// The CM is quiescent until ready is signaled; then, it starts a countdown for
+		// The CM is quiescent until ready is signaled; then, it start a countdown for
 		// leader election.
 		// 收到ready信号前，CM都是静默的；收到信号之后，就会开始选主倒计时
 		<-ready
@@ -96,7 +103,33 @@ type RequestVoteReply struct {
 }
 
 // RequestVote rpc
-func (cm *ConsensusModule) RequestVote(req RequestVoteArgs, resp *RequestVoteReply) error {
+func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	if cm.state == Dead {
+		return nil
+	}
+
+	cm.dlogf("RequestVote: %+v, [currentTerm=%d, votedFor=%d]", args, cm.currentTerm, cm.votedFor)
+
+	// 请求中的任期大于本地任期，转换为追随者状态
+	if args.Term > cm.currentTerm {
+		cm.dlogf("...term out of date in RequestVote")
+		cm.becomeFollower(args.Term)
+	}
+
+	// 任期相同，且未投票或已投票给当前请求伙伴，则返回赞成投票；否则，返回反对投票。
+	if cm.currentTerm == args.Term && (cm.votedFor == -1 || cm.votedFor == args.CandidateID) {
+		reply.VoteGranted = true
+		cm.votedFor = args.CandidateID
+		cm.electionResetEvent = time.Now()
+	} else {
+		reply.VoteGranted = false
+	}
+
+	reply.Term = cm.currentTerm
+	cm.dlogf("... RequestVote reply: %+v", reply)
 	return nil
 }
 
@@ -119,6 +152,13 @@ func (cm *ConsensusModule) dlogf(format string, args ...interface{}) {
 	}
 }
 
+// Report reports the state of this CM.
+func (cm *ConsensusModule) Report() (id int, term int, isLeader bool) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return cm.id, cm.currentTerm, cm.state == Leader
+}
+
 // Stop stops this CM, cleaning up its state. This method returns quickly, but
 // it may take a bit of time (up to ~election timeout) fot all goroutines to
 // exit.
@@ -134,7 +174,7 @@ func (cm *ConsensusModule) Stop() {
 
 // startElection starts a new election with this CM as a candidate.
 // Expects cm.mu to be locked.
-// startElection方法会将该C作为候选人发起新一轮选举，要求cm.mu被锁定
+// startElection 方法会将该CM作为候选人发起新一轮选举，要求cm.mu被锁定
 func (cm *ConsensusModule) startElection() {
 	cm.state = Candidate
 	cm.currentTerm++
@@ -152,9 +192,9 @@ func (cm *ConsensusModule) startElection() {
 				CandidateID: cm.id,
 			}
 			var reply RequestVoteReply
-			cm.dlogf("sending vote to %d: %v", peerID, args)
+			cm.dlogf("sending vote request to %d: %v", peerID, args)
 
-			if err := cm.server.Call(peerID, "ConsensusModuleModule.RequestVote", args, &reply); err == nil {
+			if err := cm.server.Call(peerID, "ConsensusModule.RequestVote", args, &reply); err == nil {
 				cm.mu.Lock()
 				defer cm.mu.Unlock()
 				cm.dlogf("receive RequestVoteReply: %v", reply)
@@ -181,6 +221,7 @@ func (cm *ConsensusModule) startElection() {
 						if votes*2 > len(cm.peerIDs)+1 {
 							cm.dlogf("wins election with %d votes", votes)
 							cm.startLeader()
+							return
 						}
 					}
 				}
@@ -188,6 +229,7 @@ func (cm *ConsensusModule) startElection() {
 		}(peerID)
 	}
 
+	// run another election timer, in case this election not successful.
 	// 另行启动一个选举定时器，以防本次选举不成功
 	go cm.runElectionTimer()
 }
@@ -297,6 +339,29 @@ type AppendEntriesReply struct {
 }
 
 func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	if cm.state == Dead {
+		return nil
+	}
+
+	if args.Term > cm.currentTerm {
+		cm.dlogf("...term out of date in RequestVote")
+		cm.becomeFollower(args.Term)
+	}
+
+	reply.Success = false
+	if args.Term == cm.currentTerm {
+		if cm.state != Follower {
+			cm.becomeFollower(args.Term)
+		}
+		cm.electionResetEvent = time.Now()
+		reply.Success = true
+	}
+
+	reply.Term = cm.currentTerm
+	cm.dlogf("AppendEntries: %+v", *reply)
 	return nil
 }
 
