@@ -12,6 +12,17 @@ import (
 
 const DebugC = 1
 
+type CommitEntry struct {
+	// 被提交的客户端指令
+	Command interface{}
+
+	// 被提交的客户端指令索引
+	Index int
+
+	// 指令提交时的任期
+	Term int
+}
+
 // LogEntry used for record log.
 type LogEntry struct {
 	Command interface{}
@@ -57,7 +68,13 @@ type ConsensusModule struct {
 	// 所有服务器都需要持久化存储的 Raft state
 	currentTerm int
 	votedFor    int
-	log         []LogEntry
+
+	nextIndex  []int
+	matchIndex []int
+
+	log                []LogEntry
+	commitIndex        int
+	newCommitReadyChan chan struct{}
 
 	state              CState
 	electionResetEvent time.Time
@@ -374,13 +391,28 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 	cm.mu.Unlock()
 
 	for _, peerID := range cm.peerIDs {
-		args := AppendEntriesArgs{
-			Term:     savedCurrentTerm,
-			LeaderID: cm.id,
-		}
-
 		go func(peerID int) {
-			cm.dlogf("sending AppendEntries to %v: ni=%d, args=%+v", peerID, 0, args)
+			cm.mu.Lock()
+			nextIdx := cm.nextIndex[peerID]
+			prevLogIdx := nextIdx - 1
+			prevLogTerm := -1
+			if prevLogIdx >= 0 {
+				prevLogTerm = cm.log[prevLogIdx].Term
+			}
+
+			entries := cm.log[nextIdx:]
+			args := AppendEntriesArgs{
+				Term:     savedCurrentTerm,
+				LeaderID: cm.id,
+
+				PrevLogIndex: prevLogIdx,
+				PrevLogTerm:  prevLogTerm,
+				LeaderCommit: cm.commitIndex,
+				Entries:      entries,
+			}
+			cm.mu.Unlock()
+
+			cm.dlogf("sending AppendEntries to %v: ni=%d, args=%+v", peerID, nextIdx, args)
 			var reply AppendEntriesReply
 
 			if err := cm.server.Call(peerID, "ConsensusModule.AppendEntries", args, &reply); err == nil {
@@ -391,7 +423,52 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 					cm.becomeFollower(reply.Term)
 					return
 				}
+
+				if cm.state == Leader && savedCurrentTerm == reply.Term {
+					if reply.Success {
+						cm.nextIndex[peerID] = nextIdx + len(entries)
+						cm.matchIndex[peerID] = cm.nextIndex[peerID] - 1
+						cm.dlogf("AppendEntries reply from %d success: nextIndex := %v, matchIndex := %v", peerID, cm.nextIndex, cm.matchIndex)
+
+						savedCommitIndex := cm.commitIndex
+						for i := cm.commitIndex + 1; i < len(cm.log); i++ {
+							if cm.log[i].Term == savedCurrentTerm {
+								matchCount := 1
+								for _, id := range cm.peerIDs {
+									if cm.matchIndex[id] >= i {
+										matchCount++
+									}
+								}
+
+								if matchCount*2 > len(cm.peerIDs)+1 {
+									cm.commitIndex = i
+								}
+							}
+						}
+
+						if cm.commitIndex != savedCommitIndex {
+							cm.dlogf("leader sets commitIndex := %d", cm.commitIndex)
+							cm.newCommitReadyChan <- struct{}{}
+						}
+					} else {
+						cm.nextIndex[peerID] = nextIdx - 1
+						cm.dlogf("AppendEntries reply from %d !success: nextIndex := %d", peerID, nextIdx-1)
+					}
+				}
 			}
 		}(peerID)
 	}
+}
+
+func (cm *ConsensusModule) Submit(command interface{}) bool {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	cm.dlogf("Submit received by %v: %v", cm.state, command)
+	if cm.state == Leader {
+		cm.log = append(cm.log, LogEntry{command, cm.currentTerm})
+		cm.dlogf("... log=%v", cm.log)
+		return true
+	}
+	return false
 }
