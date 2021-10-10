@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-const DebugC = 1
+const DebugCM = 1
 
 type CommitEntry struct {
 	// 被提交的客户端指令
@@ -54,7 +54,7 @@ func (cs CState) String() string {
 }
 
 type ConsensusModule struct {
-	mu *sync.Mutex
+	mu sync.Mutex
 
 	// 当前CM服务器的ID
 	id int
@@ -80,11 +80,10 @@ type ConsensusModule struct {
 	electionResetEvent time.Time
 }
 
-// NewConsensusModuleModule creates a new CM with the given ID, list of peer IDs and
+// NewConsensusModule creates a new CM with the given ID, list of peer IDs and
 // server. The ready channel signals the CM that all peers are connected and
 // it's safe to start its state machine.
-
-// NewConsensusModuleModule方法使用给定的服务器ID、同伴ID列表peerIds以及服务器server来创建一个新的CM实例。
+// NewConsensusModule 方法使用给定的服务器ID、同伴ID列表peerIds以及服务器server来创建一个新的CM实例。
 // ready channel用于告知CM所有的同伴都已经连接成功，可以安全启动状态机。
 func NewConsensusModule(id int, peerIDs []int, server *Server, ready <-chan struct{}) *ConsensusModule {
 	cm := new(ConsensusModule)
@@ -95,7 +94,7 @@ func NewConsensusModule(id int, peerIDs []int, server *Server, ready <-chan stru
 	cm.votedFor = -1
 
 	go func() {
-		// The CM is quiescent until ready is signaled; then, it start a countdown for
+		// The CM is quiescent until ready is signaled; then, it starts a countdown for
 		// leader election.
 		// 收到ready信号前，CM都是静默的；收到信号之后，就会开始选主倒计时
 		<-ready
@@ -127,12 +126,11 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 	if cm.state == Dead {
 		return nil
 	}
-
 	cm.dlogf("RequestVote: %+v, [currentTerm=%d, votedFor=%d]", args, cm.currentTerm, cm.votedFor)
 
 	// 请求中的任期大于本地任期，转换为追随者状态
 	if args.Term > cm.currentTerm {
-		cm.dlogf("...term out of date in RequestVote")
+		cm.dlogf("... term out of date in RequestVote")
 		cm.becomeFollower(args.Term)
 	}
 
@@ -163,7 +161,7 @@ func (cm *ConsensusModule) electionTimeout() time.Duration {
 
 // dlogf records a debug info, if DebugC > 0.
 func (cm *ConsensusModule) dlogf(format string, args ...interface{}) {
-	if DebugC > 0 {
+	if DebugCM > 0 {
 		format = fmt.Sprintf("[%d] %s", cm.id, format)
 		log.Printf(format, args...)
 	}
@@ -209,12 +207,12 @@ func (cm *ConsensusModule) startElection() {
 				CandidateID: cm.id,
 			}
 			var reply RequestVoteReply
-			cm.dlogf("sending vote request to %d: %v", peerID, args)
+			cm.dlogf("sending RequestVote to %d: %+v", peerID, args)
 
 			if err := cm.server.Call(peerID, "ConsensusModule.RequestVote", args, &reply); err == nil {
 				cm.mu.Lock()
 				defer cm.mu.Unlock()
-				cm.dlogf("receive RequestVoteReply: %v", reply)
+				cm.dlogf("received RequestVoteReply: %+v", reply)
 
 				// 状态不是候选人，退出选举（可能退化为追随者，也可能已经胜选成为领导者）
 				if cm.state != Candidate {
@@ -288,7 +286,7 @@ func (cm *ConsensusModule) runElectionTimer() {
 
 		// 任期变化
 		if termStarted != cm.currentTerm {
-			cm.dlogf("election timer term changed from %d to %d, exit", termStarted, cm.currentTerm)
+			cm.dlogf("in election timer term changed from %d to %d, balling out", termStarted, cm.currentTerm)
 			cm.mu.Unlock()
 			return
 		}
@@ -321,12 +319,13 @@ func (cm *ConsensusModule) becomeFollower(term int) {
 // startLeader方法将c转换为领导者，并启动心跳程序。要求cm.mu锁定
 func (cm *ConsensusModule) startLeader() {
 	cm.state = Leader
-	cm.dlogf("becomes Leader term:%s log:%v", cm.currentTerm, cm.log)
+	cm.dlogf("becomes Leader term:%d log:%v", cm.currentTerm, cm.log)
 
 	go func() {
-		ticker := time.NewTicker(10 * time.Millisecond)
+		ticker := time.NewTicker(50 * time.Millisecond)
 		defer ticker.Stop()
 
+		// Send periodic heartbeats, as long as still leader.
 		for {
 			cm.leaderSendHeartbeats()
 			<-ticker.C
@@ -362,9 +361,11 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 	if cm.state == Dead {
 		return nil
 	}
+	cm.dlogf("AppendEntries: %+v", args)
 
+	// 请求中的任期大于本地任期，转换为追随者状态
 	if args.Term > cm.currentTerm {
-		cm.dlogf("...term out of date in RequestVote")
+		cm.dlogf("... term out of date in AppendEntries")
 		cm.becomeFollower(args.Term)
 	}
 
@@ -378,7 +379,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 	}
 
 	reply.Term = cm.currentTerm
-	cm.dlogf("AppendEntries: %+v", *reply)
+	cm.dlogf("AppendEntries reply: %+v", *reply)
 	return nil
 }
 
@@ -390,73 +391,95 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 	savedCurrentTerm := cm.currentTerm
 	cm.mu.Unlock()
 
-	for _, peerID := range cm.peerIDs {
-		go func(peerID int) {
-			cm.mu.Lock()
-			nextIdx := cm.nextIndex[peerID]
-			prevLogIdx := nextIdx - 1
-			prevLogTerm := -1
-			if prevLogIdx >= 0 {
-				prevLogTerm = cm.log[prevLogIdx].Term
-			}
+	/*
+		for _, peerID := range cm.peerIDs {
+			go func(peerID int) {
+				cm.mu.Lock()
+				nextIdx := cm.nextIndex[peerID]
+				prevLogIdx := nextIdx - 1
+				prevLogTerm := -1
+				if prevLogIdx >= 0 {
+					prevLogTerm = cm.log[prevLogIdx].Term
+				}
 
-			entries := cm.log[nextIdx:]
-			args := AppendEntriesArgs{
-				Term:     savedCurrentTerm,
-				LeaderID: cm.id,
+				entries := cm.log[nextIdx:]
+				args := AppendEntriesArgs{
+					Term:     savedCurrentTerm,
+					LeaderID: cm.id,
 
-				PrevLogIndex: prevLogIdx,
-				PrevLogTerm:  prevLogTerm,
-				LeaderCommit: cm.commitIndex,
-				Entries:      entries,
-			}
-			cm.mu.Unlock()
+					PrevLogIndex: prevLogIdx,
+					PrevLogTerm:  prevLogTerm,
+					LeaderCommit: cm.commitIndex,
+					Entries:      entries,
+				}
+				cm.mu.Unlock()
 
-			cm.dlogf("sending AppendEntries to %v: ni=%d, args=%+v", peerID, nextIdx, args)
+				cm.dlogf("sending AppendEntries to %v: ni=%d, args=%+v", peerID, nextIdx, args)
+				var reply AppendEntriesReply
+
+				if err := cm.server.Call(peerID, "ConsensusModule.AppendEntries", args, &reply); err == nil {
+					cm.mu.Lock()
+					defer cm.mu.Unlock()
+					if reply.Term > savedCurrentTerm {
+						cm.dlogf("term out of date in heatbeat reply")
+						cm.becomeFollower(reply.Term)
+						return
+					}
+
+					if cm.state == Leader && savedCurrentTerm == reply.Term {
+						if reply.Success {
+							cm.nextIndex[peerID] = nextIdx + len(entries)
+							cm.matchIndex[peerID] = cm.nextIndex[peerID] - 1
+							cm.dlogf("AppendEntries reply from %d success: nextIndex := %v, matchIndex := %v", peerID, cm.nextIndex, cm.matchIndex)
+
+							savedCommitIndex := cm.commitIndex
+							for i := cm.commitIndex + 1; i < len(cm.log); i++ {
+								if cm.log[i].Term == savedCurrentTerm {
+									matchCount := 1
+									for _, id := range cm.peerIDs {
+										if cm.matchIndex[id] >= i {
+											matchCount++
+										}
+									}
+
+									if matchCount*2 > len(cm.peerIDs)+1 {
+										cm.commitIndex = i
+									}
+								}
+							}
+
+							if cm.commitIndex != savedCommitIndex {
+								cm.dlogf("leader sets commitIndex := %d", cm.commitIndex)
+								cm.newCommitReadyChan <- struct{}{}
+							}
+						} else {
+							cm.nextIndex[peerID] = nextIdx - 1
+							cm.dlogf("AppendEntries reply from %d !success: nextIndex := %d", peerID, nextIdx-1)
+						}
+					}
+				}
+			}(peerID)
+		}
+	*/
+
+	for _, peerId := range cm.peerIDs {
+		args := AppendEntriesArgs{
+			Term:     savedCurrentTerm,
+			LeaderID: cm.id,
+		}
+		go func(peerId int) {
+			cm.dlogf("sending AppendEntries to %v: ni=%d, args=%+v", peerId, 0, args)
 			var reply AppendEntriesReply
-
-			if err := cm.server.Call(peerID, "ConsensusModule.AppendEntries", args, &reply); err == nil {
+			if err := cm.server.Call(peerId, "ConsensusModule.AppendEntries", args, &reply); err == nil {
 				cm.mu.Lock()
 				defer cm.mu.Unlock()
 				if reply.Term > savedCurrentTerm {
-					cm.dlogf("term out of date in heatbeat reply")
+					cm.dlogf("term out of date in heartbeat reply")
 					cm.becomeFollower(reply.Term)
 					return
 				}
-
-				if cm.state == Leader && savedCurrentTerm == reply.Term {
-					if reply.Success {
-						cm.nextIndex[peerID] = nextIdx + len(entries)
-						cm.matchIndex[peerID] = cm.nextIndex[peerID] - 1
-						cm.dlogf("AppendEntries reply from %d success: nextIndex := %v, matchIndex := %v", peerID, cm.nextIndex, cm.matchIndex)
-
-						savedCommitIndex := cm.commitIndex
-						for i := cm.commitIndex + 1; i < len(cm.log); i++ {
-							if cm.log[i].Term == savedCurrentTerm {
-								matchCount := 1
-								for _, id := range cm.peerIDs {
-									if cm.matchIndex[id] >= i {
-										matchCount++
-									}
-								}
-
-								if matchCount*2 > len(cm.peerIDs)+1 {
-									cm.commitIndex = i
-								}
-							}
-						}
-
-						if cm.commitIndex != savedCommitIndex {
-							cm.dlogf("leader sets commitIndex := %d", cm.commitIndex)
-							cm.newCommitReadyChan <- struct{}{}
-						}
-					} else {
-						cm.nextIndex[peerID] = nextIdx - 1
-						cm.dlogf("AppendEntries reply from %d !success: nextIndex := %d", peerID, nextIdx-1)
-					}
-				}
 			}
-		}(peerID)
+		}(peerId)
 	}
 }
 
