@@ -76,10 +76,9 @@ func (h *Harness) DisconnectPeer(id int) {
 	tlog("Disconnect %d", id)
 	h.cluster[id].DisconnectAll()
 
-	// other servers disconnect from server which id equal its id
 	for i := 0; i < h.n; i++ {
 		if i != id {
-			err := h.cluster[i].DisconnectPeer(id)
+			err := h.cluster[id].DisconnectPeer(i)
 			if err != nil {
 				tlog("%v", err)
 			}
