@@ -12,6 +12,8 @@ import (
 
 const DebugCM = 1
 
+// CommitEntry 是Raft向提交通道发送的数据。每一条提交的条目都会通知客户端，
+// 表明指令已满足一致性，可以应用到客户端的状态机上。
 type CommitEntry struct {
 	// 被提交的客户端指令
 	Command interface{}
@@ -68,16 +70,26 @@ type ConsensusModule struct {
 	// 所有服务器都需要持久化存储的 Raft state
 	currentTerm int
 	votedFor    int
+	log         []LogEntry
 
-	nextIndex  []int
-	matchIndex []int
+	// commitChan is the channel where this CM is going to report committed log
+	// entries. It's passed in by the client during construction.
+	commitChan chan<- CommitEntry
 
-	log                []LogEntry
-	commitIndex        int
+	// newCommitReadyChan is an internal notification channel used by goroutines
+	// that commit new entries to the log to notify that these entries may be sent
+	// on commitChan.
 	newCommitReadyChan chan struct{}
 
+	// Volatile Raft state on all servers
+	commitIndex        int
+	lastApplied        int
 	state              CState
 	electionResetEvent time.Time
+
+	// Volatile Raft state on leaders
+	nextIndex  map[int]int
+	matchIndex map[int]int
 }
 
 // NewConsensusModule creates a new CM with the given ID, list of peer IDs and
@@ -85,13 +97,22 @@ type ConsensusModule struct {
 // it's safe to start its state machine.
 // NewConsensusModule 方法使用给定的服务器ID、同伴ID列表peerIds以及服务器server来创建一个新的CM实例。
 // ready channel用于告知CM所有的同伴都已经连接成功，可以安全启动状态机。
-func NewConsensusModule(id int, peerIDs []int, server *Server, ready <-chan struct{}) *ConsensusModule {
+func NewConsensusModule(id int, peerIDs []int, server *Server,
+	ready <-chan struct{}, commitChan chan<- CommitEntry) *ConsensusModule {
 	cm := new(ConsensusModule)
 	cm.id = id
 	cm.peerIDs = peerIDs
 	cm.server = server
 	cm.state = Follower
 	cm.votedFor = -1
+	cm.commitIndex = -1
+	cm.lastApplied = -1
+
+	cm.commitChan = commitChan
+	cm.newCommitReadyChan = make(chan struct{}, 16)
+
+	cm.nextIndex = make(map[int]int)
+	cm.matchIndex = make(map[int]int)
 
 	go func() {
 		// The CM is quiescent until ready is signaled; then, it starts a countdown for
@@ -103,6 +124,8 @@ func NewConsensusModule(id int, peerIDs []int, server *Server, ready <-chan stru
 		cm.mu.Unlock()
 		cm.runElectionTimer()
 	}()
+
+	go cm.commitChanSender()
 	return cm
 }
 
@@ -126,6 +149,7 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 	if cm.state == Dead {
 		return nil
 	}
+	lastLogIndex, lastLogTerm := cm.lastLogIndexAndTerm()
 	cm.dlogf("RequestVote: %+v, [currentTerm=%d, votedFor=%d]", args, cm.currentTerm, cm.votedFor)
 
 	// 请求中的任期大于本地任期，转换为追随者状态
@@ -134,8 +158,12 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 		cm.becomeFollower(args.Term)
 	}
 
-	// 任期相同，且未投票或已投票给当前请求伙伴，则返回赞成投票；否则，返回反对投票。
-	if cm.currentTerm == args.Term && (cm.votedFor == -1 || cm.votedFor == args.CandidateID) {
+	// 任期相同，且未投票或已投票给当前请求伙伴，且候选人的日志满足安全性要求
+	// 则返回赞成投票；否则，返回反对投票。
+	if cm.currentTerm == args.Term &&
+		(cm.votedFor == -1 || cm.votedFor == args.CandidateID) &&
+		(args.LastLogTerm > lastLogTerm ||
+			(args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)) {
 		reply.VoteGranted = true
 		cm.votedFor = args.CandidateID
 		cm.electionResetEvent = time.Now()
@@ -174,6 +202,23 @@ func (cm *ConsensusModule) Report() (id int, term int, isLeader bool) {
 	return cm.id, cm.currentTerm, cm.state == Leader
 }
 
+// Submit 方法会向CM呈递一条新的指令。这个函数是非阻塞的;
+// 客户端读取构造函数中传入的commit channel，以获得新提交条目的通知。
+// 如果当前CM是领导者，并且返回true —— 表示指令被接受了。
+// 如果返回false，客户端会寻找新的服务器呈递该指令。
+func (cm *ConsensusModule) Submit(command interface{}) bool {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	cm.dlogf("Submit received by %v: %v", cm.state, command)
+	if cm.state == Leader {
+		cm.log = append(cm.log, LogEntry{command, cm.currentTerm})
+		cm.dlogf("... log=%v", cm.log)
+		return true
+	}
+	return false
+}
+
 // Stop stops this CM, cleaning up its state. This method returns quickly, but
 // it may take a bit of time (up to ~election timeout) fot all goroutines to
 // exit.
@@ -185,6 +230,7 @@ func (cm *ConsensusModule) Stop() {
 
 	cm.state = Dead
 	cm.dlogf("becomes dead")
+	close(cm.newCommitReadyChan)
 }
 
 // startElection starts a new election with this CM as a candidate.
@@ -202,10 +248,16 @@ func (cm *ConsensusModule) startElection() {
 	var votesReceived uint32 = 1
 	for _, peerID := range cm.peerIDs {
 		go func(peerID int) {
+			cm.mu.Lock()
+			savedLastLogIndex, savedLastLogTerm := cm.lastLogIndexAndTerm()
+			cm.mu.Unlock()
 			args := RequestVoteArgs{
-				Term:        savedCurrentTerm,
-				CandidateID: cm.id,
+				Term:         savedCurrentTerm,
+				CandidateID:  cm.id,
+				LastLogIndex: savedLastLogIndex,
+				LastLogTerm:  savedLastLogTerm,
 			}
+
 			var reply RequestVoteReply
 			cm.dlogf("sending RequestVote to %d: %+v", peerID, args)
 
@@ -255,7 +307,7 @@ func (cm *ConsensusModule) startElection() {
 // This function is blocking and should be launched in a separate goroutine;
 // it's designed to work for a single (one-shot) election timer, as it exits
 // whenever the CM state changes from follower/candidate or the term changes.
-
+//
 // runElectionTimer实现的是选举定时器。如果我们想在新一轮选举中作为候选人，就要启动这个定时器。
 // 该方法是阻塞的，需要在独立的goroutine中运行；它应该用作单次（一次性）选举定时器，
 // 因为一旦任期变化或者c状态不是追随者/候选人，该方法就会退出。
@@ -319,6 +371,11 @@ func (cm *ConsensusModule) becomeFollower(term int) {
 // startLeader方法将c转换为领导者，并启动心跳程序。要求cm.mu锁定
 func (cm *ConsensusModule) startLeader() {
 	cm.state = Leader
+
+	for _, peerID := range cm.peerIDs {
+		cm.nextIndex[peerID] = len(cm.log)
+		cm.matchIndex[peerID] = -1
+	}
 	cm.dlogf("becomes Leader term:%d log:%v", cm.currentTerm, cm.log)
 
 	go func() {
@@ -329,6 +386,7 @@ func (cm *ConsensusModule) startLeader() {
 		for {
 			cm.leaderSendHeartbeats()
 			<-ticker.C
+
 			cm.mu.Lock()
 			if cm.state != Leader {
 				cm.mu.Unlock()
@@ -375,7 +433,46 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 			cm.becomeFollower(args.Term)
 		}
 		cm.electionResetEvent = time.Now()
-		reply.Success = true
+
+		// Does our log contain an entry at PrevLogIndex whose term matches
+		// PrevLogTerm? Note that in the extreme case of PrevLogIndex=-1 this is
+		// vacuously true.
+		if args.PrevLogIndex == -1 ||
+			(args.PrevLogIndex < len(cm.log) && args.PrevLogTerm == cm.log[args.PrevLogIndex].Term) {
+			reply.Success = true
+
+			// Find an insertion point - where there's a term mismatch between
+			// the existing log starting at PrevLogIndex+1 and the new entries sent
+			// in the RPC.
+			// 找到插入点 —— 索引从PrevLogIndex+1开始的本地日志与RPC发送的新条目间出现任期不匹配的位置。
+			logInsertIndex := args.PrevLogIndex + 1
+			newEntriesIndex := 0
+			for {
+				if logInsertIndex >= len(cm.log) || newEntriesIndex >= len(args.Entries) {
+					break
+				}
+				if cm.log[logInsertIndex].Term != args.Entries[newEntriesIndex].Term {
+					break
+				}
+				logInsertIndex++
+				newEntriesIndex++
+			}
+			// 循环结束时：
+			//  - logInsertIndex指向本地日志结尾，或者是与领导者发送日志间存在任期冲突的索引位置
+			//  - newEntriesIndex指向请求条目的结尾，或者是与本地日志存在任期冲突的索引位置
+			if newEntriesIndex < len(args.Entries) {
+				cm.dlogf("... inserting entries %v from index %d", args.Entries[newEntriesIndex:], logInsertIndex)
+				cm.log = append(cm.log[:logInsertIndex], args.Entries[newEntriesIndex:]...)
+				cm.dlogf("... log is now: %v", cm.log)
+			}
+
+			// Set commit index.
+			if args.LeaderCommit > cm.commitIndex {
+				cm.commitIndex = intMin(args.LeaderCommit, len(cm.log)-1)
+				cm.dlogf("... setting commitIndex=%d", cm.commitIndex)
+				cm.newCommitReadyChan <- struct{}{}
+			}
+		}
 	}
 
 	reply.Term = cm.currentTerm
@@ -391,86 +488,32 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 	savedCurrentTerm := cm.currentTerm
 	cm.mu.Unlock()
 
-	/*
-		for _, peerID := range cm.peerIDs {
-			go func(peerID int) {
-				cm.mu.Lock()
-				nextIdx := cm.nextIndex[peerID]
-				prevLogIdx := nextIdx - 1
-				prevLogTerm := -1
-				if prevLogIdx >= 0 {
-					prevLogTerm = cm.log[prevLogIdx].Term
-				}
+	for _, peerID := range cm.peerIDs {
+		go func(peerID int) {
+			cm.mu.Lock()
+			nextLogIdx := cm.nextIndex[peerID]
+			prevLogIdx := nextLogIdx - 1
+			prevLogTerm := -1
+			if prevLogIdx >= 0 {
+				prevLogTerm = cm.log[prevLogIdx].Term
+			}
 
-				entries := cm.log[nextIdx:]
-				args := AppendEntriesArgs{
-					Term:     savedCurrentTerm,
-					LeaderID: cm.id,
+			entries := cm.log[nextLogIdx:]
+			args := AppendEntriesArgs{
+				Term:     savedCurrentTerm,
+				LeaderID: cm.id,
 
-					PrevLogIndex: prevLogIdx,
-					PrevLogTerm:  prevLogTerm,
-					LeaderCommit: cm.commitIndex,
-					Entries:      entries,
-				}
-				cm.mu.Unlock()
+				PrevLogIndex: prevLogIdx,
+				PrevLogTerm:  prevLogTerm,
+				LeaderCommit: cm.commitIndex,
+				Entries:      entries,
+			}
+			cm.mu.Unlock()
 
-				cm.dlogf("sending AppendEntries to %v: ni=%d, args=%+v", peerID, nextIdx, args)
-				var reply AppendEntriesReply
-
-				if err := cm.server.Call(peerID, "ConsensusModule.AppendEntries", args, &reply); err == nil {
-					cm.mu.Lock()
-					defer cm.mu.Unlock()
-					if reply.Term > savedCurrentTerm {
-						cm.dlogf("term out of date in heatbeat reply")
-						cm.becomeFollower(reply.Term)
-						return
-					}
-
-					if cm.state == Leader && savedCurrentTerm == reply.Term {
-						if reply.Success {
-							cm.nextIndex[peerID] = nextIdx + len(entries)
-							cm.matchIndex[peerID] = cm.nextIndex[peerID] - 1
-							cm.dlogf("AppendEntries reply from %d success: nextIndex := %v, matchIndex := %v", peerID, cm.nextIndex, cm.matchIndex)
-
-							savedCommitIndex := cm.commitIndex
-							for i := cm.commitIndex + 1; i < len(cm.log); i++ {
-								if cm.log[i].Term == savedCurrentTerm {
-									matchCount := 1
-									for _, id := range cm.peerIDs {
-										if cm.matchIndex[id] >= i {
-											matchCount++
-										}
-									}
-
-									if matchCount*2 > len(cm.peerIDs)+1 {
-										cm.commitIndex = i
-									}
-								}
-							}
-
-							if cm.commitIndex != savedCommitIndex {
-								cm.dlogf("leader sets commitIndex := %d", cm.commitIndex)
-								cm.newCommitReadyChan <- struct{}{}
-							}
-						} else {
-							cm.nextIndex[peerID] = nextIdx - 1
-							cm.dlogf("AppendEntries reply from %d !success: nextIndex := %d", peerID, nextIdx-1)
-						}
-					}
-				}
-			}(peerID)
-		}
-	*/
-
-	for _, peerId := range cm.peerIDs {
-		args := AppendEntriesArgs{
-			Term:     savedCurrentTerm,
-			LeaderID: cm.id,
-		}
-		go func(peerId int) {
-			cm.dlogf("sending AppendEntries to %v: ni=%d, args=%+v", peerId, 0, args)
+			cm.dlogf("sending AppendEntries to %v: ni=%d, args=%+v", peerID, nextLogIdx, args)
 			var reply AppendEntriesReply
-			if err := cm.server.Call(peerId, "ConsensusModule.AppendEntries", args, &reply); err == nil {
+
+			if err := cm.server.Call(peerID, "ConsensusModule.AppendEntries", args, &reply); err == nil {
 				cm.mu.Lock()
 				defer cm.mu.Unlock()
 				if reply.Term > savedCurrentTerm {
@@ -478,20 +521,97 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 					cm.becomeFollower(reply.Term)
 					return
 				}
+
+				if cm.state == Leader && savedCurrentTerm == reply.Term {
+					if reply.Success {
+						cm.nextIndex[peerID] = nextLogIdx + len(entries)
+						cm.matchIndex[peerID] = cm.nextIndex[peerID] - 1
+						cm.dlogf("AppendEntries reply from %d success: nextIndex := %v, matchIndex := %v",
+							peerID, cm.nextIndex, cm.matchIndex)
+
+						// 每给一个Follower同步完日志，就会判断是否已经完成半数以上节点同步log
+						// 如果半数以上节点完成，commitIndex更新到最新logIndex
+						savedCommitIndex := cm.commitIndex
+						for i := cm.commitIndex + 1; i < len(cm.log); i++ {
+							if cm.log[i].Term == cm.currentTerm {
+								matchCount := 1
+								for _, peerID := range cm.peerIDs {
+									if cm.matchIndex[peerID] >= i {
+										matchCount++
+									}
+								}
+
+								if matchCount*2 > len(cm.peerIDs)+1 {
+									cm.commitIndex = i
+								}
+							}
+						}
+
+						if cm.commitIndex != savedCommitIndex {
+							cm.dlogf("leader sets commitIndex := %d", cm.commitIndex)
+							cm.newCommitReadyChan <- struct{}{}
+						}
+					} else {
+						// todo ??
+						cm.nextIndex[peerID] = nextLogIdx - 1
+						cm.dlogf("AppendEntries reply from %d !success: nextIndex := %d", peerID, nextLogIdx-1)
+					}
+				}
 			}
-		}(peerId)
+		}(peerID)
 	}
 }
 
-func (cm *ConsensusModule) Submit(command interface{}) bool {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-
-	cm.dlogf("Submit received by %v: %v", cm.state, command)
-	if cm.state == Leader {
-		cm.log = append(cm.log, LogEntry{command, cm.currentTerm})
-		cm.dlogf("... log=%v", cm.log)
-		return true
+// lastLogIndexAndTerm returns the last log index and the last log entry's term
+// (or -1 if there's no log) for this server.
+// Expects cm.mu to be locked.
+// lastLogIndexAndTerm 返回最新的日志索引和任期，此方法希望被cm.mu锁住
+func (cm *ConsensusModule) lastLogIndexAndTerm() (int, int) {
+	if len(cm.log) > 0 {
+		lastIndex := len(cm.log) - 1
+		return lastIndex, cm.log[lastIndex].Term
 	}
-	return false
+	return -1, -1
+}
+
+// commitChanSender is responsible for sending committed entries on
+// cm.commitChan. It watches newCommitReadyChan for notifications and calculates
+// which new entries are ready to be sent. This method should run in a separate
+// background goroutine; cm.commitChan may be buffered and will limit how fast
+// the client consumes new committed entries. Returns when newCommitReadyChan is
+// closed.
+// commitChanSender 负责在cm.commitChan上发送已提交的日志条目。
+// 它会监听newCommitReadyChan的通知并检查哪些条目可以发送（给客户端）。
+// 该方法应该在单独的后台goroutine中运行；cm.commitChan可能会有缓冲来限制客户端消费已提交指令的速度。
+// 当newCommitReadyChan关闭时方法结束。
+func (cm *ConsensusModule) commitChanSender() {
+	for range cm.newCommitReadyChan {
+		cm.mu.Lock()
+		savedTerm := cm.currentTerm
+		savedLastApplied := cm.lastApplied
+		var entries []LogEntry
+
+		if cm.commitIndex > savedLastApplied {
+			entries = cm.log[savedLastApplied+1 : cm.commitIndex+1]
+			cm.lastApplied = cm.commitIndex
+		}
+		cm.mu.Unlock()
+		cm.dlogf("commitChanSender entries=%v, savedLastApplied=%d", entries, savedLastApplied)
+
+		for i, entry := range entries {
+			cm.commitChan <- CommitEntry{
+				Command: entry.Command,
+				Index:   savedLastApplied + i + 1,
+				Term:    savedTerm,
+			}
+		}
+	}
+	cm.dlogf("commitChanSender done")
+}
+
+func intMin(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
