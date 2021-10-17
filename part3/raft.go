@@ -1,6 +1,8 @@
 package raft
 
 import (
+	"bytes"
+	"encoding/gob"
 	"fmt"
 	"log"
 	"math/rand"
@@ -67,6 +69,9 @@ type ConsensusModule struct {
 	// server 包含当前CM的服务器，用于向其它同伴发起RPC请求
 	server *Server
 
+	// storage is used to persist state.
+	storage Storage
+
 	// 所有服务器都需要持久化存储的 Raft state
 	currentTerm int
 	votedFor    int
@@ -80,6 +85,10 @@ type ConsensusModule struct {
 	// that commit new entries to the log to notify that these entries may be sent
 	// on commitChan.
 	newCommitReadyChan chan struct{}
+
+	// triggerAEChan is an internal notification channel used to trigger
+	// sending new AEs to followers when interesting changes occurred.
+	triggerAEChan chan struct{}
 
 	// Volatile Raft state on all servers
 	commitIndex        int
@@ -97,22 +106,28 @@ type ConsensusModule struct {
 // it's safe to start its state machine.
 // NewConsensusModule 方法使用给定的服务器ID、同伴ID列表peerIds以及服务器server来创建一个新的CM实例。
 // ready channel用于告知CM所有的同伴都已经连接成功，可以安全启动状态机。
-func NewConsensusModule(id int, peerIDs []int, server *Server,
+func NewConsensusModule(id int, peerIDs []int, server *Server, storage Storage,
 	ready <-chan struct{}, commitChan chan<- CommitEntry) *ConsensusModule {
 	cm := new(ConsensusModule)
 	cm.id = id
 	cm.peerIDs = peerIDs
 	cm.server = server
+	cm.storage = storage
 	cm.state = Follower
 	cm.votedFor = -1
 	cm.commitIndex = -1
 	cm.lastApplied = -1
 
 	cm.commitChan = commitChan
+	cm.triggerAEChan = make(chan struct{}, 1)
 	cm.newCommitReadyChan = make(chan struct{}, 16)
 
 	cm.nextIndex = make(map[int]int)
 	cm.matchIndex = make(map[int]int)
+
+	if cm.storage.HasData() {
+		cm.restoreFromStorage(cm.storage)
+	}
 
 	go func() {
 		// The CM is quiescent until ready is signaled; then, it starts a countdown for
@@ -127,6 +142,109 @@ func NewConsensusModule(id int, peerIDs []int, server *Server,
 
 	go cm.commitChanSender()
 	return cm
+}
+
+// Report reports the state of this CM.
+func (cm *ConsensusModule) Report() (id int, term int, isLeader bool) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return cm.id, cm.currentTerm, cm.state == Leader
+}
+
+// Submit 方法会向CM呈递一条新的指令。这个函数是非阻塞的;
+// 客户端读取构造函数中传入的commit channel，以获得新提交条目的通知。
+// 如果当前CM是领导者，并且返回true —— 表示指令被接受了。
+// 如果返回false，客户端会寻找新的服务器呈递该指令。
+func (cm *ConsensusModule) Submit(command interface{}) bool {
+	cm.mu.Lock()
+	cm.dlogf("Submit received by %v: %v", cm.state, command)
+
+	if cm.state == Leader {
+		cm.log = append(cm.log, LogEntry{command, cm.currentTerm})
+		cm.persistToStorage()
+		cm.dlogf("... log=%v", cm.log)
+		cm.mu.Unlock()
+		cm.triggerAEChan <- struct{}{}
+		return true
+	}
+
+	cm.mu.Unlock()
+	return false
+}
+
+// Stop stops this CM, cleaning up its state. This method returns quickly, but
+// it may take a bit of time (up to ~election timeout) fot all goroutines to
+// exit.
+// Stop方法可以暂停当前CM，清除其状态。该方法很快结束，
+// 但是所有的goroutine退出可能需要一点时间（取决于 选举等待时间）
+func (cm *ConsensusModule) Stop() {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	cm.state = Dead
+	cm.dlogf("becomes dead")
+	close(cm.newCommitReadyChan)
+}
+
+// restoreFromStorage restores the persistent stat of this CM from storage.
+// It should be called during constructor, before any concurrency concerns.
+func (cm *ConsensusModule) restoreFromStorage(storage Storage) {
+	if termData, ok := cm.storage.Get("currentTerm"); ok {
+		d := gob.NewDecoder(bytes.NewBuffer(termData))
+		if err := d.Decode(&cm.currentTerm); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		log.Fatal("currentTerm not found in storage")
+	}
+
+	if votedData, ok := cm.storage.Get("votedFor"); ok {
+		d := gob.NewDecoder(bytes.NewBuffer(votedData))
+		if err := d.Decode(&cm.votedFor); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		log.Fatal("votedFor not found in storage")
+	}
+
+	if logData, ok := cm.storage.Get("log"); ok {
+		d := gob.NewDecoder(bytes.NewBuffer(logData))
+		if err := d.Decode(&cm.log); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		log.Fatal("log not found in storage")
+	}
+}
+
+// persistToStorage saves all of CM's persistent state in cm.storage.
+// Expects cm.mu to be locked.
+func (cm *ConsensusModule) persistToStorage() {
+	var termData bytes.Buffer
+	if err := gob.NewEncoder(&termData).Encode(cm.currentTerm); err != nil {
+		log.Fatal(err)
+	}
+	cm.storage.Set("currentTerm", termData.Bytes())
+
+	var votedData bytes.Buffer
+	if err := gob.NewEncoder(&votedData).Encode(cm.votedFor); err != nil {
+		log.Fatal(err)
+	}
+	cm.storage.Set("votedFor", votedData.Bytes())
+
+	var logData bytes.Buffer
+	if err := gob.NewEncoder(&logData).Encode(cm.log); err != nil {
+		log.Fatal(err)
+	}
+	cm.storage.Set("log", logData.Bytes())
+}
+
+// dlogf records a debug info, if DebugC > 0.
+func (cm *ConsensusModule) dlogf(format string, args ...interface{}) {
+	if DebugCM > 0 {
+		format = fmt.Sprintf("[%d] %s", cm.id, format)
+		log.Printf(format, args...)
+	}
 }
 
 type RequestVoteArgs struct {
@@ -172,6 +290,7 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 	}
 
 	reply.Term = cm.currentTerm
+	cm.persistToStorage()
 	cm.dlogf("... RequestVote reply: %+v", reply)
 	return nil
 }
@@ -185,52 +304,6 @@ func (cm *ConsensusModule) electionTimeout() time.Duration {
 		return time.Duration(150) * time.Millisecond
 	}
 	return time.Duration(150+rand.Intn(150)) * time.Millisecond
-}
-
-// dlogf records a debug info, if DebugC > 0.
-func (cm *ConsensusModule) dlogf(format string, args ...interface{}) {
-	if DebugCM > 0 {
-		format = fmt.Sprintf("[%d] %s", cm.id, format)
-		log.Printf(format, args...)
-	}
-}
-
-// Report reports the state of this CM.
-func (cm *ConsensusModule) Report() (id int, term int, isLeader bool) {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-	return cm.id, cm.currentTerm, cm.state == Leader
-}
-
-// Submit 方法会向CM呈递一条新的指令。这个函数是非阻塞的;
-// 客户端读取构造函数中传入的commit channel，以获得新提交条目的通知。
-// 如果当前CM是领导者，并且返回true —— 表示指令被接受了。
-// 如果返回false，客户端会寻找新的服务器呈递该指令。
-func (cm *ConsensusModule) Submit(command interface{}) bool {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-
-	cm.dlogf("Submit received by %v: %v", cm.state, command)
-	if cm.state == Leader {
-		cm.log = append(cm.log, LogEntry{command, cm.currentTerm})
-		cm.dlogf("... log=%v", cm.log)
-		return true
-	}
-	return false
-}
-
-// Stop stops this CM, cleaning up its state. This method returns quickly, but
-// it may take a bit of time (up to ~election timeout) fot all goroutines to
-// exit.
-// Stop方法可以暂停当前CM，清除其状态。该方法很快结束，
-// 但是所有的goroutine退出可能需要一点时间（取决于 选举等待时间）
-func (cm *ConsensusModule) Stop() {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-
-	cm.state = Dead
-	cm.dlogf("becomes dead")
-	close(cm.newCommitReadyChan)
 }
 
 // startElection starts a new election with this CM as a candidate.
@@ -376,25 +449,52 @@ func (cm *ConsensusModule) startLeader() {
 		cm.nextIndex[peerID] = len(cm.log)
 		cm.matchIndex[peerID] = -1
 	}
-	cm.dlogf("becomes Leader term:%d log:%v", cm.currentTerm, cm.log)
+	cm.dlogf("becomes Leader; term=%d, nextIndex=%v, matchIndex=%v; log=%v",
+		cm.currentTerm, cm.nextIndex, cm.matchIndex, cm.log)
 
-	go func() {
-		ticker := time.NewTicker(50 * time.Millisecond)
-		defer ticker.Stop()
+	go func(heartbeatTimeout time.Duration) {
+		// Immediately send AEs to peers.
+		cm.leaderSendAEs()
+
+		t := time.NewTimer(50 * time.Millisecond)
+		defer t.Stop()
 
 		// Send periodic heartbeats, as long as still leader.
 		for {
-			cm.leaderSendHeartbeats()
-			<-ticker.C
+			doSend := false
+			select {
+			case <-t.C:
+				doSend = true
 
-			cm.mu.Lock()
-			if cm.state != Leader {
-				cm.mu.Unlock()
-				return
+				// Reset timer to fire again after heartbeatTimeout.
+				t.Stop()
+				t.Reset(heartbeatTimeout)
+			case _, ok := <-cm.triggerAEChan:
+				if ok {
+					doSend = true
+				} else {
+					return
+				}
+
+				// Reset timer for heartbeatTimeout.
+				// todo ???
+				if !t.Stop() {
+					<-t.C
+				}
+				t.Reset(heartbeatTimeout)
 			}
-			cm.mu.Unlock()
+
+			if doSend {
+				cm.mu.Lock()
+				if cm.state != Leader {
+					cm.mu.Unlock()
+					return
+				}
+				cm.mu.Unlock()
+				cm.leaderSendAEs()
+			}
 		}
-	}()
+	}(50 * time.Millisecond)
 }
 
 type AppendEntriesArgs struct {
@@ -410,6 +510,11 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+
+	// Faster conflict resolution optimization (described near the end of section
+	// 5.3 in the paper.)
+	ConflictIndex int
+	ConflictTerm  int
 }
 
 func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
@@ -472,18 +577,39 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 				cm.dlogf("... setting commitIndex=%d", cm.commitIndex)
 				cm.newCommitReadyChan <- struct{}{}
 			}
+		} else {
+			// No match for PrevLogIndex/PrevLogTerm. Populate
+			// ConflictIndex/ConflictTerm to help the leader bring us up to date
+			// quickly.
+			if args.PrevLogIndex >= len(cm.log) {
+				reply.ConflictIndex = args.PrevLogIndex
+				reply.ConflictTerm = -1
+			} else {
+				// PrevLogIndex points within our log, but PrevLogTerm doesn't match
+				// cm.log[PrevLogIndex].
+				reply.ConflictTerm = cm.log[args.PrevLogIndex].Term
+
+				var i int
+				for i = args.PrevLogIndex - 1; i >= 0; i-- {
+					if cm.log[i].Term != reply.ConflictTerm {
+						break
+					}
+				}
+				reply.ConflictIndex = i + 1
+			}
 		}
 	}
 
 	reply.Term = cm.currentTerm
+	cm.persistToStorage()
 	cm.dlogf("AppendEntries reply: %+v", *reply)
 	return nil
 }
 
-// leaderSendHeartbeats sends a round of heartbeats to all peers, collects their
-// replies and adjusts cm's state
+// leaderSendAEs sends a round of AEs to all peers, collects their
+// replies and adjusts cm's state.
 // leaderSendHeartbeats 方法向所有同伴发送心跳，收集各自的回复并调整c的状态值
-func (cm *ConsensusModule) leaderSendHeartbeats() {
+func (cm *ConsensusModule) leaderSendAEs() {
 	cm.mu.Lock()
 	savedCurrentTerm := cm.currentTerm
 	cm.mu.Unlock()
@@ -526,8 +652,6 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 					if reply.Success {
 						cm.nextIndex[peerID] = nextLogIdx + len(entries)
 						cm.matchIndex[peerID] = cm.nextIndex[peerID] - 1
-						cm.dlogf("AppendEntries reply from %d success: nextIndex := %v, matchIndex := %v",
-							peerID, cm.nextIndex, cm.matchIndex)
 
 						// 每给一个Follower同步完日志，就会判断是否已经完成半数以上节点同步log
 						// 如果半数以上节点完成，commitIndex更新到最新logIndex
@@ -547,13 +671,34 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 							}
 						}
 
+						cm.dlogf("AppendEntries reply from %d success: nextIndex := %v, matchIndex := %v; commitIndex := %d",
+							peerID, cm.nextIndex, cm.matchIndex, cm.commitIndex)
 						if cm.commitIndex != savedCommitIndex {
 							cm.dlogf("leader sets commitIndex := %d", cm.commitIndex)
+							// Commit index changed: the leader considers new entries to be
+							// committed. Send new entries on the commit channel to this
+							// leader's clients, and notify followers by sending them AEs.
 							cm.newCommitReadyChan <- struct{}{}
+							cm.triggerAEChan <- struct{}{}
 						}
 					} else {
-						// todo ??
-						cm.nextIndex[peerID] = nextLogIdx - 1
+						if reply.ConflictIndex >= 0 {
+							lastIndexOfTerm := -1
+							for i := len(cm.log) - 1; i >= 0; i-- {
+								if cm.log[i].Term == reply.ConflictTerm {
+									lastIndexOfTerm = i
+									break
+								}
+							}
+
+							if lastIndexOfTerm >= 0 {
+								cm.nextIndex[peerID] = lastIndexOfTerm + 1
+							} else {
+								cm.nextIndex[peerID] = reply.ConflictIndex
+							}
+						} else {
+							cm.nextIndex[peerID] = reply.ConflictIndex
+						}
 						cm.dlogf("AppendEntries reply from %d !success: nextIndex := %d", peerID, nextLogIdx-1)
 					}
 				}

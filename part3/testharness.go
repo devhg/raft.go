@@ -18,6 +18,7 @@ type Harness struct {
 
 	// cluster is a list of all the raft servers participating in a cluster.
 	cluster []*Server
+	storage []*MapStorage
 
 	// commitChans has a channel per server in cluster with the commit channel for
 	// that server.
@@ -33,6 +34,11 @@ type Harness struct {
 	// will pass to or from it).
 	connected []bool
 
+	// alive has a bool per server in cluster, specifying whether this server is
+	// currently alive (false means it has crashed and wasn't restarted yet).
+	// connected implies alive.
+	alive []bool
+
 	n int
 	t *testing.T
 }
@@ -42,9 +48,11 @@ type Harness struct {
 func NewHarness(t *testing.T, n int) *Harness {
 	ns := make([]*Server, n)
 	connected := make([]bool, n)
+	alive := make([]bool, n)
 	commitChans := make([]chan CommitEntry, n)
 	commits := make([][]CommitEntry, n)
 	ready := make(chan struct{})
+	storage := make([]*MapStorage, n)
 
 	// Create all Servers in this cluster, assign ids and peer ids.
 	for i := 0; i < n; i++ {
@@ -55,9 +63,11 @@ func NewHarness(t *testing.T, n int) *Harness {
 			}
 		}
 
+		storage[i] = NewMapStorage()
 		commitChans[i] = make(chan CommitEntry)
-		ns[i] = NewServer(i, peerIDs, ready, commitChans[i])
+		ns[i] = NewServer(i, peerIDs, storage[i], ready, commitChans[i])
 		ns[i].Serve()
+		alive[i] = true
 	}
 
 	// Connect all peers to each other.
@@ -73,9 +83,11 @@ func NewHarness(t *testing.T, n int) *Harness {
 
 	h := &Harness{
 		cluster:     ns,
+		storage:     storage,
 		connected:   connected,
 		commits:     commits,
 		commitChans: commitChans,
+		alive:       alive,
 		n:           n,
 		t:           t,
 	}
@@ -93,7 +105,10 @@ func (h *Harness) Shutdown() {
 		h.connected[i] = false
 	}
 	for i := 0; i < h.n; i++ {
-		h.cluster[i].Shutdown()
+		if h.alive[i] {
+			h.alive[i] = false
+			h.cluster[i].Shutdown()
+		}
 	}
 	for i := 0; i < h.n; i++ {
 		close(h.commitChans[i])
@@ -121,7 +136,7 @@ func (h *Harness) DisconnectPeer(id int) {
 func (h *Harness) ReconnectPeer(id int) {
 	tlog("Reconnect %d", id)
 	for i := 0; i < h.n; i++ {
-		if i != id {
+		if i != id && h.alive[i] {
 			if err := h.cluster[id].ConnectToPeer(i, h.cluster[i].GetListenAddr()); err != nil {
 				h.t.Fatal(err)
 			}
@@ -131,6 +146,47 @@ func (h *Harness) ReconnectPeer(id int) {
 		}
 	}
 	h.connected[id] = true
+}
+
+// CrashPeer "crashes" a server by disconnecting it from all peers and then
+// asking it to shut down. We're not going to use the same server instance
+// again, but its storage is retained.
+func (h *Harness) CrashPeer(id int) {
+	tlog("Crash %d", id)
+	h.DisconnectPeer(id)
+	h.alive[id] = false
+	h.cluster[id].Shutdown()
+
+	// Clear out the commits slice for the crashed server; Raft assumes the client
+	// has no persistent state. Once this server comes back online it will replay
+	// the whole log to us.
+	h.mu.Lock()
+	h.commits[id] = h.commits[id][:0]
+	h.mu.Unlock()
+}
+
+// RestartPeer "restarts" a server by creating a new Server instance and giving
+// it the appropriate storage, reconnecting it to peers.
+func (h *Harness) RestartPeer(id int) {
+	if h.alive[id] {
+		log.Fatalf("id=%d is alive in RestartPeer", id)
+	}
+	tlog("Restart %d", id)
+
+	var peerIDs []int
+	for i := 0; i < h.n; i++ {
+		if id != i {
+			peerIDs = append(peerIDs, i)
+		}
+	}
+
+	ready := make(chan struct{})
+	h.cluster[id] = NewServer(id, peerIDs, h.storage[id], ready, h.commitChans[id])
+	h.cluster[id].Serve()
+	h.ReconnectPeer(id)
+	close(ready)
+	h.alive[id] = true
+	sleepMs(20)
 }
 
 // CheckSingleLeader checks that only a single server thinks it's the leader.
